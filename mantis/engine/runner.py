@@ -65,6 +65,7 @@ class Agent:
         self.state_store = state_store
         self.approval = ApprovalManager(patterns=approval_patterns)
         self.graph_tool_manager = graph_tool_manager
+        self._session_id: str | None = None
 
     # ─── 세션 상태 저장/복구 ───
 
@@ -126,6 +127,7 @@ class Agent:
             resume: True이면 기존 세션에서 이어서 실행 (실패 재개)
         """
         session_id = session_id or str(uuid.uuid4())
+        self._session_id = session_id
         trace_id = self.trace.start_trace(session_id=session_id, agent_name=self.name)
 
         # 실패 재개: 기존 상태 복구
@@ -137,7 +139,7 @@ class Agent:
         self.context.add_user(user_input)
 
         for iteration in range(MAX_ITERATIONS):
-            # ── 도구 스키마 결정: graph-tool-call 또는 전체 목록 ──
+            # ── v2: 매 iteration마다 최신 도구 조회 ──
             tools_schema = self._resolve_tools_schema(user_input)
 
             # ── Think ──
@@ -238,7 +240,8 @@ class Agent:
                 act_start = time.time()
                 try:
                     result = await self.tool_registry.execute(
-                        {"name": actual_name, "arguments": actual_args}
+                        {"name": actual_name, "arguments": actual_args},
+                        session_id=self._session_id,
                     )
                 except Exception as e:
                     # 도구 실행 실패 → 상태 저장 (실패 재개 지원)
@@ -299,7 +302,7 @@ class Agent:
             except Exception as e:
                 logger.error("graph-tool-call 검색 실패: %s — 전체 도구 사용", e)
 
-        return self.tool_registry.to_openai_tools()
+        return self.tool_registry.to_openai_tools(session_id=self._session_id)
 
     def _is_graph_search_active(self) -> bool:
         """graph-tool-call 검색 모드 활성 여부."""
@@ -322,6 +325,7 @@ class Agent:
             thinking, tool_call, tool_result, approval_required, done, error
         """
         session_id = session_id or str(uuid.uuid4())
+        self._session_id = session_id
         trace_id = self.trace.start_trace(session_id=session_id, agent_name=self.name)
 
         if resume:
@@ -332,7 +336,7 @@ class Agent:
         self.context.add_user(user_input)
 
         for iteration in range(MAX_ITERATIONS):
-            # ── 도구 스키마 결정: graph-tool-call 또는 전체 목록 ──
+            # ── v2: 매 iteration마다 최신 도구 조회 ──
             tools_schema = self._resolve_tools_schema(user_input)
 
             yield {"type": "thinking", "data": {
@@ -427,7 +431,8 @@ class Agent:
                 _tool_start = time.time()
                 try:
                     result = await self.tool_registry.execute(
-                        {"name": actual_name, "arguments": actual_args}
+                        {"name": actual_name, "arguments": actual_args},
+                        session_id=self._session_id,
                     )
                 except Exception as e:
                     await self._save_state(session_id)

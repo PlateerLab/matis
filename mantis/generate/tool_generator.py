@@ -122,10 +122,12 @@ class ToolGenerator:
         self.tools_dir = Path(tools_dir)
         self.tools_dir.mkdir(parents=True, exist_ok=True)
 
-    async def generate(self, request: str) -> dict[str, Any]:
+    async def generate(self, request: str, session_id: str | None = None) -> dict[str, Any]:
         """사용자 요청에서 도구 생성.
 
         파이프라인: LLM 코드생성 → 문법검증 → 기능테스트 → 파일저장 → Registry 등록
+
+        v2: session_id가 있으면 해당 세션에 등록 (즉시 사용 가능).
 
         Returns:
             {"status": "success|failed", "name": "도구명", "code": "코드", ...}
@@ -187,10 +189,12 @@ class ToolGenerator:
         file_path.write_text(code, encoding="utf-8")
         logger.info("[ToolGenerator] 파일 저장: %s", file_path)
 
-        # Step 6: Registry에 등록
+        # Step 6: Registry에 등록 (v2: source + session_id)
         try:
-            loaded = self.tool_registry.load_from_file(file_path)
-            logger.info("[ToolGenerator] Registry 등록 완료: %s (loaded=%d)", tool_name, loaded)
+            loaded = self.tool_registry.load_from_file(
+                file_path, source="generated", session_id=session_id,
+            )
+            logger.info("[ToolGenerator] Registry 등록 완료: %s (loaded=%d, session=%s)", tool_name, loaded, session_id)
             return {
                 "status": "success",
                 "name": tool_name,
@@ -319,10 +323,11 @@ class ToolGenerator:
 
 
 
-# AI 도구 생성을 위한 빌트인 도구
+# ─── v1 호환: 모듈 레벨 create_tool (기존 코드 유지) ───
+
 @tool(
     name="create_tool",
-    description="사용자의 자연어 설명을 바탕으로 새로운 도구(@tool)를 AI가 자동 생성한다. 코드를 생성하고 샌드박스에서 테스트한 뒤 Tool Registry에 등록한다. 예: '주문 내역을 조회하는 도구를 만들어줘'",
+    description="사용자의 자연어 설명을 바탕으로 새로운 도구(@tool)를 AI가 자동 생성한다. 코드를 생성하고 샌드박스에서 테스트한 뒤 Tool Registry에 등록한다.",
     parameters={
         "description": {
             "type": "string",
@@ -335,8 +340,43 @@ async def create_tool(description: str) -> dict:
     if not _generator_ref:
         return {
             "status": "error",
-            "error": "ToolGenerator 미초기화 — MODEL_API_BASE_URL / MODEL_API_KEY 설정 필요",
+            "error": "ToolGenerator 미초기화 — set_tool_generator() 필요",
         }
 
     result = await _generator_ref.generate(description)
     return result
+
+
+# ─── v2: 팩토리 함수 — ToolGenerator 인스턴스를 받아서 도구로 변환 ───
+
+def make_create_tool(generator: ToolGenerator) -> ToolSpec:
+    """ToolGenerator를 Agent가 호출할 수 있는 @tool로 변환.
+
+    v2 패턴: 모듈 전역 대신 팩토리 함수로 생성.
+    session_id는 Agent가 _session_id로 관리하므로, 여기서는 None으로 등록.
+
+    Usage:
+        generator = ToolGenerator(llm=llm, registry=registry, sandbox=sandbox)
+        spec = make_create_tool(generator)
+        registry.register(spec, source="builtin")
+    """
+
+    @tool(
+        name="create_tool",
+        description=(
+            "새로운 도구를 만든다. 설명을 받아 Python 코드를 생성하고, "
+            "Docker 컨테이너에서 테스트한 후 등록한다. "
+            "등록 즉시 다음 호출부터 사용 가능."
+        ),
+        parameters={
+            "description": {
+                "type": "string",
+                "description": "만들 도구의 기능 설명",
+            },
+        },
+    )
+    async def _create_tool(description: str) -> dict:
+        result = await generator.generate(description)
+        return result
+
+    return _create_tool._tool_spec
