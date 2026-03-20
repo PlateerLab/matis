@@ -4,34 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
 import httpx
 
+from mantis.llm.protocol import ModelResponse, ToolCall
+
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class ToolCall:
-    """LLM이 요청한 도구 호출."""
-
-    id: str
-    name: str
-    arguments: dict[str, Any]
-
-
-@dataclass
-class ModelResponse:
-    """LLM 응답."""
-
-    text: str | None = None
-    tool_calls: list[ToolCall] = field(default_factory=list)
-    usage: dict[str, int] = field(default_factory=dict)
-
-    @property
-    def has_tool_calls(self) -> bool:
-        return len(self.tool_calls) > 0
 
 
 class ModelClient:

@@ -5,36 +5,27 @@
 
 **Execution engine for AI agents.**
 
-Runs the Think → Act → Observe loop as a library. Tools flow dynamically across generators, executors, and validators — create a tool mid-conversation and use it immediately on the next iteration.
-
-## The Problem
-
-AI agent execution code tends to collapse into a single function with no structure:
+The engine is just two things: a Generator and an Executor. Everything else is a tool.
 
 ```python
-# A real production file — 694 lines, one function, 9 concerns:
-async def execute(workflow_data, user_input, ...):
-    load_workflow()          # DB
-    apply_file_selection()   # preprocessing
-    create_executor()        # LangChain black box
-    async for chunk in stream:
-        parse_agent_event()  # regex on "[AGENT_EVENT]" tags
-        sanitize_io()        # postprocessing
-    save_to_db()             # persistence
-    update_redis()           # state
+from mantis import Agent, tool, ToolRegistry
+from mantis.llm import ModelClient
+
+@tool(name="greet", description="Greet someone by name",
+      parameters={"name": {"type": "string", "description": "Name to greet"}})
+async def greet(name: str) -> dict:
+    return {"message": f"Hello {name}"}
+
+registry = ToolRegistry()
+registry.register(greet._tool_spec)
+
+agent = Agent(
+    name="bot",
+    model_client=ModelClient(base_url="https://api.openai.com/v1", model="gpt-4o-mini", api_key="sk-..."),
+    tool_registry=registry,
+)
+result = await agent.run("Say hello to Alice")
 ```
-
-| Problem | Status quo |
-|---------|-----------|
-| LangChain lock-in | Agent execution is a black box — can't detach |
-| All 30 tools sent to LLM | Token waste + accuracy drop |
-| Tools are static | Can't create tools mid-conversation |
-| No sandbox as tool | Agent can't run code on demand |
-| No approval workflow | Dangerous actions run unchecked |
-| No failure recovery | Error = restart from scratch |
-| Workflows need a canvas | Can't compose workflows in code |
-
-**Mantis replaces all of this with a phase-based pipeline and a live tool registry.**
 
 ## Installation
 
@@ -46,28 +37,36 @@ pip install mantis[state]       # + PostgreSQL checkpointing
 pip install mantis[all]         # everything
 ```
 
-## Quick Start
+Only required dependency is `httpx`.
 
-```python
-from mantis import Agent, tool, ToolRegistry
-from mantis.llm.openai_provider import ModelClient
+## Core Design — Everything is a Tool
 
-@tool(name="lookup_order", description="Look up order status by ID")
-async def lookup_order(order_id: str) -> dict:
-    return {"order_id": order_id, "status": "shipped"}
-
-registry = ToolRegistry()
-registry.register(lookup_order._tool_spec, source="builtin")
-
-agent = Agent(
-    name="order-bot",
-    model_client=ModelClient(model="gpt-4o-mini", api_key="sk-..."),
-    tool_registry=registry,
-    system_prompt="You answer questions about orders.",
-)
-
-result = await agent.run("What's the status of order ABC-123?")
 ```
+If it can be a tool → make it a tool.
+Only what can't be a tool → is engine.
+```
+
+**Engine (3 components)**
+
+| Component | Role |
+|-----------|------|
+| `Agent` | Think→Act→Observe loop. The entity that calls tools. |
+| `ToolGenerator` | Creates tools. LLM code generation → sandbox validation → registry. |
+| `WorkflowGenerator` | Creates workflows. LLM design → tool validation → store. |
+
+**Everything else = tools**
+
+| Tool | What it does |
+|------|-------------|
+| `execute_code` | Run Python code in a Docker container |
+| `execute_code_with_test` | Run code + test together |
+| `create_tool` | AI tool generation → validation → registration |
+| `generate_workflow` | Auto-design a workflow from natural language |
+| `create_workflow` | Manually define a workflow |
+| `run_workflow` | Execute a saved workflow |
+| `list_workflows` | List registered workflows |
+| `search_tools` | Search for tools by query |
+| `list_tools` | List all available tools |
 
 ## Streaming
 
@@ -80,46 +79,93 @@ async for event in agent.run_stream("Look up my order"):
         case "done":        print(f"done: {event['data']}")
 ```
 
-## Live Tool Registry
+## Live ToolRegistry
 
-The core design: **one ToolRegistry shared by all components**. Tools created mid-conversation are available on the next iteration.
+One registry shared by all components. Tools created mid-conversation are available on the next iteration.
 
 ```python
-# Agent creates a tool → immediately usable
-# Iteration 1: LLM calls create_tool("send slack message") → generated + registered
-# Iteration 2: LLM calls send_slack(channel="#general", text="hello") → works
+# Iteration 1: LLM → create_tool("send slack message") → generated + registered
+# Iteration 2: LLM → send_slack(channel="#general", text="hello") → works immediately
 ```
 
-Session-scoped tools are isolated per conversation:
+Session-scoped tool isolation:
 
 ```python
 registry = ToolRegistry()
-
-# Global tool — visible to all sessions
-registry.register(spec, source="builtin")
-
-# Session tool — visible only in this session, cleaned up on end
-registry.register(spec, source="generated", session_id="sess-123")
-
-# Merge global + session tools for LLM
-tools = registry.to_openai_tools(session_id="sess-123")
+registry.register(spec, source="builtin")                          # global
+registry.register(spec, source="generated", session_id="sess-123") # session-only
+tools = registry.to_openai_tools(session_id="sess-123")            # global + session merged
+registry.cleanup_session("sess-123")                                # cleanup on session end
 ```
+
+## LLMProvider Protocol
+
+Plug in any LLM implementation:
+
+```python
+from mantis import Agent, LLMProvider
+from mantis.llm import ModelClient
+
+# Built-in: OpenAI-compatible
+agent = Agent(name="bot", model_client=ModelClient(base_url="...", model="gpt-4o"), ...)
+
+# Custom LLM — just match the Protocol
+class MyLLM:
+    async def generate(self, messages, tools=None, temperature=0.7):
+        # call your own server
+        return ModelResponse(text="...", tool_calls=[])
+
+agent = Agent(name="bot", model_client=MyLLM(), ...)
+```
+
+## Middleware
+
+Things that must run automatically (not chosen by the agent) = middleware.
+
+```python
+from mantis.middleware import (
+    ApprovalMiddleware, TraceMiddleware,
+    GraphSearchMiddleware, AutoCorrectMiddleware, StateMiddleware,
+)
+
+agent = Agent(
+    name="bot",
+    model_client=llm,
+    tool_registry=registry,
+    middlewares=[
+        TraceMiddleware(),                                          # auto-record execution flow
+        ApprovalMiddleware(patterns=["DELETE *", "send_slack"]),     # block dangerous actions
+        GraphSearchMiddleware(threshold=15),                         # auto-filter when 15+ tools
+        AutoCorrectMiddleware(),                                     # fix tool name typos
+        StateMiddleware(store=StateStore()),                         # auto checkpoint/restore
+    ],
+)
+```
+
+Middleware hooks:
+
+| Hook | When | Purpose |
+|------|------|---------|
+| `on_start` | Execution start | Session restore |
+| `on_before_llm` | Before LLM call | Tool filtering |
+| `on_before_tool` | Before tool call | Approval / auto-correction |
+| `on_after_tool` | After tool call | Tracing / checkpointing |
+| `on_end` | Execution end | State persistence |
 
 ## Sandbox as a Tool
 
-The sandbox isn't just infrastructure — it's a tool the agent can call directly:
+The agent can freely run code:
 
 ```python
-from mantis.sandbox.sandbox import DockerSandbox
-from mantis.sandbox.tools import make_sandbox_tools
+from mantis.sandbox import DockerSandbox, make_sandbox_tools
 
 sandbox = DockerSandbox()
 for spec in make_sandbox_tools(sandbox):
     registry.register(spec, source="sandbox")
 
-# Now the agent can freely run code:
-#   LLM → execute_code(code="import pandas; df = pd.read_csv(...)")
-#   LLM → execute_code_with_test(code="...", test_code="assert ...")
+# Agent calls:
+#   execute_code(code="import pandas; df = pd.read_csv('data.csv'); print(df.describe())")
+#   execute_code_with_test(code="def add(a,b): return a+b", test_code="assert add(1,2)==3; print('ALL_TESTS_PASSED')")
 ```
 
 ## AI Tool Generation
@@ -127,165 +173,195 @@ for spec in make_sandbox_tools(sandbox):
 Create tools at runtime — generate code, test in sandbox, register instantly:
 
 ```python
-from mantis.generate.tool_generator import ToolGenerator, make_create_tool
+from mantis.generate import ToolGenerator, make_create_tool
 
-generator = ToolGenerator(llm=client, registry=registry, sandbox=sandbox)
+generator = ToolGenerator(model_client=llm, tool_registry=registry)
 registry.register(make_create_tool(generator), source="builtin")
 
-# Agent can now call create_tool("fetch weather data from OpenWeatherMap API")
-# → LLM generates code → sandbox validates → registry registers → next iteration uses it
+# Agent calls:
+#   create_tool("fetch weather data from OpenWeatherMap API")
+#   → LLM generates code → sandbox validates → registry registers → next iteration uses it
 ```
 
-## Architecture
+## Workflows
 
-### 5-Phase Pipeline
-
-```
-PREPARE  →  RESOLVE  →  EXECUTE  →  STREAM  →  PERSIST
-```
-
-| Phase | Role | What it does |
-|-------|------|-------------|
-| **PREPARE** | Setup | Session init, DAG sort, context assembly |
-| **RESOLVE** | Decide | Tool verification, graph search, RAG, memory load |
-| **EXECUTE** | Run | Think→Act→Observe loop with live tool refresh each iteration |
-| **STREAM** | Deliver | Execution events → SSE / JSON / workflow format |
-| **PERSIST** | Save | DB write, trace flush, state update (runs even on error) |
-
-### Tool Flow
-
-```
-Sources                      ToolRegistry                Consumers
-────────                     ────────────                ─────────
-@tool decorator    ──register──→                    ──→  Executor (refresh each iter)
-make_sandbox_tools ──register──→  to_openai_tools   ──→  GraphToolManager (search)
-make_create_tool   ──register──→  (session_id)      ──→  LLM (function calling)
-MCP Bridge         ──register──→                    ──→  WorkflowEngine (node binding)
-OpenAPI Loader     ──register──→
-```
-
-### Workflow Engine (planned)
-
-Replace xgen-workflow's canvas executor with code-composable workflows:
+Auto-design and execute complex multi-step tasks:
 
 ```python
-from mantis.workflow import WorkflowEngine, AgentNode, RouterNode, Edge
+from mantis.workflow import WorkflowStore, WorkflowRunner, WorkflowGenerator, make_workflow_tools
 
-engine = WorkflowEngine(registry=registry)
-engine.add_node(AgentNode(id="analyze", model="gpt-4o-mini"))
-engine.add_node(RouterNode(id="check", conditions={
-    "good": lambda s: s["confidence"] > 0.8,
-    "retry": lambda s: s["confidence"] <= 0.8,
-}))
+wf_store = WorkflowStore()
+wf_runner = WorkflowRunner(registry=registry, model_client=llm)
+wf_generator = WorkflowGenerator(model_client=llm, registry=registry, store=wf_store)
 
-engine.add_edge(Edge("analyze", "result", "check", "input"))
-engine.add_edge(Edge("check", "retry", "analyze", "text"))  # loop back
+for spec in make_workflow_tools(wf_store, wf_runner, wf_generator):
+    registry.register(spec, source="builtin")
 
-# Or load from canvas JSON (xgen-workflow compatible):
-engine = WorkflowEngine.from_canvas(workflow_json, registry)
+# Agent calls:
+#   generate_workflow("analyze sales data and create a report")
+#   → LLM sees available tools, designs optimal step sequence
+#   → run_workflow("sales_analysis", input_data={"file": "sales.csv"})
+```
+
+Workflow step types:
+
+| Type | What it does |
+|------|-------------|
+| `tool` | Call a tool from the registry directly |
+| `condition` | Branch based on previous step results |
+| `agent` | Delegate to a sub-agent |
+| `parallel` | Run multiple steps concurrently |
+
+## Full Example
+
+```python
+from mantis import Agent, tool, ToolRegistry
+from mantis.llm import ModelClient
+from mantis.sandbox import DockerSandbox, make_sandbox_tools
+from mantis.generate import ToolGenerator, make_create_tool
+from mantis.workflow import WorkflowStore, WorkflowRunner, WorkflowGenerator, make_workflow_tools
+from mantis.tools.meta import make_registry_tools
+from mantis.middleware import ApprovalMiddleware, TraceMiddleware
+
+# Engine
+registry = ToolRegistry()
+llm = ModelClient(base_url="https://api.openai.com/v1", model="gpt-4o-mini", api_key="sk-...")
+
+# User tools
+@tool(name="lookup_order", description="Look up order status by ID",
+      parameters={"order_id": {"type": "string", "description": "Order ID"}})
+async def lookup_order(order_id: str) -> dict:
+    return {"order_id": order_id, "status": "shipped"}
+registry.register(lookup_order._tool_spec, source="builtin")
+
+# Sandbox tools
+sandbox = DockerSandbox()
+for spec in make_sandbox_tools(sandbox):
+    registry.register(spec, source="sandbox")
+
+# Tool generator
+generator = ToolGenerator(model_client=llm, tool_registry=registry)
+registry.register(make_create_tool(generator), source="builtin")
+
+# Workflow tools
+wf_store = WorkflowStore()
+wf_runner = WorkflowRunner(registry=registry, model_client=llm)
+wf_gen = WorkflowGenerator(model_client=llm, registry=registry, store=wf_store)
+for spec in make_workflow_tools(wf_store, wf_runner, wf_gen):
+    registry.register(spec, source="builtin")
+
+# Registry meta tools
+for spec in make_registry_tools(registry):
+    registry.register(spec, source="builtin")
+
+# Agent + middleware
+agent = Agent(
+    name="full-agent",
+    model_client=llm,
+    tool_registry=registry,
+    system_prompt="You are a helpful assistant.",
+    middlewares=[
+        TraceMiddleware(),
+        ApprovalMiddleware(patterns=["DELETE *"]),
+    ],
+)
+
+# Run
+async for event in agent.run_stream("Build a sales analysis workflow and run it"):
+    print(event)
+```
+
+## Standalone Usage
+
+Every infrastructure module works independently without the Agent:
+
+```python
+# Sandbox only
+from mantis.sandbox import DockerSandbox
+result = await DockerSandbox().execute("print(sum(range(1, 101)))")
+
+# Tool search only (pip install mantis[search])
+from mantis.search import GraphToolManager
+graph = GraphToolManager()
+graph.ingest_from_registry(registry)
+results = graph.retrieve("order lookup", top_k=5)
 ```
 
 ## Package Structure
 
 ```
 mantis/
-├── __init__.py             # Public API: Agent, tool, ToolSpec, ToolRegistry
-├── __main__.py             # CLI: python -m mantis
+├── __init__.py                  # Agent, tool, ToolRegistry, LLMProvider, exceptions
+├── exceptions.py                # MantisError hierarchy
+│
 ├── engine/
-│   └── runner.py           # Agent — Think→Act→Observe with live tool refresh
+│   └── runner.py                # Agent — Think→Act→Observe + middleware chain
+│
 ├── tools/
-│   ├── decorator.py        # @tool decorator + ToolSpec
-│   └── registry.py         # ToolRegistry — session scope, source tracking
+│   ├── decorator.py             # @tool, ToolSpec
+│   ├── registry.py              # ToolRegistry (session scope, source tracking)
+│   └── meta.py                  # make_registry_tools() — search_tools, list_tools
+│
 ├── llm/
-│   └── openai_provider.py  # OpenAI-compatible LLM client
-├── pipeline/
-│   ├── pipeline.py         # ExecutionPipeline — 5-phase orchestrator
-│   ├── phases.py           # Phase implementations
-│   └── models.py           # ExecutionContext, ExecutionEvent, etc.
-├── context/
-│   └── conversation.py     # Multi-turn conversation management
-├── safety/
-│   └── approval.py         # Pattern-based approval workflow
-├── trace/
-│   ├── collector.py        # Execution tracing
-│   └── exporter.py         # Trace export (JSON, log)
-├── search/                 # requires: mantis[search]
-│   └── graph_search.py     # graph-tool-call retrieval + auto-correction
-├── sandbox/                # requires: mantis[sandbox]
-│   ├── sandbox.py          # Docker container isolation
-│   ├── runner.py           # Legacy sandbox tools
-│   └── tools.py            # make_sandbox_tools() factory
+│   ├── protocol.py              # LLMProvider Protocol, ModelResponse, ToolCall
+│   └── openai_provider.py       # ModelClient (OpenAI-compatible, default impl)
+│
+├── middleware/
+│   ├── base.py                  # Middleware Protocol, RunContext, BaseMiddleware
+│   ├── approval.py              # ApprovalMiddleware
+│   ├── trace.py                 # TraceMiddleware
+│   ├── graph_search.py          # GraphSearchMiddleware, AutoCorrectMiddleware
+│   └── state.py                 # StateMiddleware
+│
 ├── generate/
-│   └── tool_generator.py   # AI tool generation → test → register + make_create_tool()
+│   └── tool_generator.py        # ToolGenerator + make_create_tool()
+│
+├── sandbox/                     # pip install mantis[sandbox]
+│   ├── sandbox.py               # DockerSandbox
+│   └── tools.py                 # make_sandbox_tools()
+│
+├── workflow/
+│   ├── models.py                # WorkflowDef, WorkflowStep, StepExecutor Protocol
+│   ├── store.py                 # WorkflowStore (in-memory)
+│   ├── runner.py                # WorkflowRunner (tool/condition/agent/parallel)
+│   ├── generator.py             # WorkflowGenerator (LLM auto-design)
+│   └── tools.py                 # make_workflow_tools() — 4 workflow tools
+│
+├── search/                      # pip install mantis[search]
+│   └── graph_search.py          # GraphToolManager (graph-tool-call integration)
+│
+├── context/
+│   └── conversation.py          # ConversationContext
+│
+├── safety/
+│   └── approval.py              # ApprovalManager
+│
+├── state/                       # pip install mantis[state]
+│   └── store.py                 # StateStore (PostgreSQL)
+│
+├── trace/
+│   ├── collector.py             # TraceCollector
+│   └── exporter.py              # TraceExporter
+│
 ├── testing/
-│   ├── tool_tester.py      # Tool quality gate (smoke/assert/pytest)
-│   ├── dummy_args.py       # Type-based dummy argument generation
-│   └── pytest_runner.py    # In-sandbox pytest execution
-├── state/                  # requires: mantis[state]
-│   └── store.py            # PostgreSQL checkpoint/resume
+│   ├── tool_tester.py           # ToolTester (smoke/assert/pytest)
+│   ├── dummy_args.py            # Dummy argument generation
+│   └── pytest_runner.py         # In-sandbox pytest execution
+│
 └── adapters/
-    └── sse_adapter.py      # SSE event format conversion
-```
-
-## Features
-
-### Core
-
-| Feature | Description |
-|---------|------------|
-| `Agent` | Think→Act→Observe loop — refreshes tools from registry each iteration |
-| `@tool` | Decorator that auto-generates OpenAI function calling schema |
-| `ToolRegistry` | Session-scoped, source-tracked tool management with live refresh |
-| `ModelClient` | OpenAI-compatible API client with streaming support |
-| `ConversationContext` | Multi-turn message history management |
-| `ApprovalManager` | Pattern-based dangerous action blocking |
-| `TraceCollector` | Step-by-step execution recording |
-| `ExecutionPipeline` | 5-phase pipeline orchestrator |
-
-### Optional
-
-| Feature | Install | Description |
-|---------|---------|------------|
-| `GraphToolManager` | `mantis[search]` | Graph-based tool retrieval + name auto-correction |
-| `DockerSandbox` | `mantis[sandbox]` | Isolated code execution in Docker containers |
-| `make_sandbox_tools` | `mantis[sandbox]` | Expose sandbox as agent-callable tools |
-| `StateStore` | `mantis[state]` | PostgreSQL checkpointing and failure recovery |
-| `ToolGenerator` | needs sandbox | AI generates code → tests in sandbox → auto-registers |
-| `make_create_tool` | needs sandbox | Wrap ToolGenerator as an agent-callable tool |
-| `ToolTester` | sandbox optional | Tool quality gate — smoke test, assert, pytest |
-
-### Planned
-
-| Feature | Description |
-|---------|------------|
-| `WorkflowEngine` | Code-composable DAG execution — replaces canvas-only workflows |
-| `Tool Store` | Publish, verify, and install tools from Git or API registries |
-| `RedisBackend` | Share ToolRegistry across multiple apps via Redis |
-
-## CLI
-
-```bash
-python -m mantis --version
-python -m mantis info
-```
-
-```
-mantis 0.1.0
-
-  [O] httpx 0.28.1 — required
-  [O] graph-tool-call 0.13.1 — optional (pip install mantis[search])
-  [X] docker — optional (pip install mantis[sandbox])
-  [X] asyncpg — optional (pip install mantis[state])
+    ├── sse_adapter.py           # SSE event format conversion
+    └── canvas_adapter.py        # xgen-workflow canvas JSON → WorkflowDef
 ```
 
 ## Design Principles
 
-- **Live tool registry** — one shared registry, tools refresh each iteration, create and use in the same conversation
-- **Phase-based pipeline** — PREPARE → RESOLVE → EXECUTE → STREAM → PERSIST, each independent
-- **Sandbox is a tool** — agents run code directly, not just through generators
-- **Single required dependency** — only `httpx`; optional deps behind import guards
-- **Session isolation** — per-session tools with automatic cleanup
-- **Structured events** — typed event objects instead of string tag parsing
+- **Everything is a Tool** — Workflows, sandbox, search are all tools. Engine is just loop + generators + storage.
+- **Middleware for cross-cutting concerns** — Approval, tracing, state persistence hook into the agent loop automatically.
+- **LLMProvider Protocol** — Plug in any LLM implementation. OpenAI-compatible client included.
+- **`make_*_tools()` pattern** — Consistent factory pattern to convert infrastructure into tools.
+- **Live Registry** — Create tools mid-conversation, use them immediately. Session-scoped isolation.
+- **Single required dependency** — Only `httpx`. Everything else is optional.
+- **Standalone modules** — Use sandbox, search, or any module independently without the Agent.
 
 ## License
 

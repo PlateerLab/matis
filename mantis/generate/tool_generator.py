@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from mantis.llm.openai_provider import ModelClient
+from mantis.llm.protocol import LLMProvider
 from mantis.sandbox.sandbox import DockerSandbox, SandboxConfig
 from mantis.tools.decorator import tool, ToolSpec
 from mantis.tools.registry import ToolRegistry
@@ -113,7 +113,7 @@ class ToolGenerator:
 
     def __init__(
         self,
-        model_client: ModelClient,
+        model_client: LLMProvider,
         tool_registry: ToolRegistry,
         tools_dir: str | Path = "tools",
     ):

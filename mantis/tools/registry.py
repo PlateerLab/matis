@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from mantis.tools.decorator import ToolSpec, get_registered_tools
+from mantis.tools.decorator import ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +125,15 @@ class ToolRegistry:
             logger.exception("도구 '%s' 실행 실패", name)
             return {"name": name, "error": str(e)}
 
+    def _collect_tools_from_module(self, module: Any) -> list[ToolSpec]:
+        """모듈에서 _tool_spec이 부착된 함수를 수집."""
+        specs = []
+        for obj in vars(module).values():
+            spec = getattr(obj, '_tool_spec', None)
+            if isinstance(spec, ToolSpec):
+                specs.append(spec)
+        return specs
+
     def load_from_module(self, module_path: str) -> int:
         """Python 모듈에서 @tool이 붙은 도구를 자동 로드.
 
@@ -132,10 +141,8 @@ class ToolRegistry:
             로드된 도구 수.
         """
         before = set(self._tools.keys())
-        # 모듈 import 하면 @tool 데코레이터가 전역 레지스트리에 자동 등록됨
-        importlib.import_module(module_path)
-        # 새로 등록된 도구들을 이 레지스트리에 추가
-        for spec in get_registered_tools():
+        module = importlib.import_module(module_path)
+        for spec in self._collect_tools_from_module(module):
             if spec.name not in before:
                 self.register(spec)
         return len(self._tools) - len(before)
@@ -160,15 +167,14 @@ class ToolRegistry:
         spec_obj = importlib.util.spec_from_file_location(
             f"xgen_tool_{file_path.stem}", file_path
         )
+        count = 0
         if spec_obj and spec_obj.loader:
             module = importlib.util.module_from_spec(spec_obj)
             spec_obj.loader.exec_module(module)
-
-        count = 0
-        for tool_spec in get_registered_tools():
-            if tool_spec.name not in before:
-                self.register(tool_spec, source=source, session_id=session_id)
-                count += 1
+            for tool_spec in self._collect_tools_from_module(module):
+                if tool_spec.name not in before:
+                    self.register(tool_spec, source=source, session_id=session_id)
+                    count += 1
 
         return count
 

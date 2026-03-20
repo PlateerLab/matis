@@ -57,10 +57,6 @@ class ToolSpec:
         return self.fn(**kwargs)
 
 
-# 전역 도구 저장소 — import 시 자동 수집용
-_tool_registry: list[ToolSpec] = []
-
-
 def tool(
     name: str,
     description: str,
@@ -87,9 +83,6 @@ def tool(
             is_async=inspect.iscoroutinefunction(fn),
         )
 
-        # 전역 레지스트리에 등록
-        _tool_registry.append(spec)
-
         # 원본 함수에 메타데이터 부착
         fn._tool_spec = spec
 
@@ -101,8 +94,3 @@ def tool(
         return wrapper
 
     return decorator
-
-
-def get_registered_tools() -> list[ToolSpec]:
-    """import 시 자동 등록된 도구 목록 반환."""
-    return list(_tool_registry)

@@ -1,34 +1,46 @@
 """Agent Core — Think → Act → Observe 마스터 루프.
 
-Phase 2 확장:
-- State Store 연동 (멀티턴 컨텍스트 저장/복구)
-- Human-in-the-Loop (승인 대기 → 재개)
-- 실패 재개 (Checkpointer 패턴)
+v3: 미들웨어 기반 아키텍처.
+- LLMProvider Protocol 사용
+- Middleware 체인으로 횡단 관심사 분리
+- 레거시 파라미터 → 미들웨어 자동 변환 (하위 호환)
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import time
 import uuid
+import warnings
 from typing import Any, AsyncIterator
 
 from mantis.context.conversation import ConversationContext
-from mantis.llm.openai_provider import ModelClient, ModelResponse, ToolCall
-from mantis.safety.approval import ApprovalManager, ApprovalStatus
+from mantis.exceptions import LLMError, ToolExecutionError
+from mantis.llm.protocol import LLMProvider, ModelResponse, ToolCall
+from mantis.middleware.base import BaseMiddleware, Middleware, RunContext
 from mantis.tools.registry import ToolRegistry
-from mantis.trace.collector import TraceCollector, StepType
+
+# 미들웨어 임포트 — 선택 의존성이므로 try/except
+try:
+    from mantis.middleware.trace import TraceMiddleware
+except ImportError:
+    TraceMiddleware = None  # type: ignore[assignment,misc]
 
 try:
-    from mantis.search.graph_search import GraphToolManager
+    from mantis.middleware.approval import ApprovalMiddleware
 except ImportError:
-    GraphToolManager = None  # type: ignore[assignment,misc]
+    ApprovalMiddleware = None  # type: ignore[assignment,misc]
 
 try:
-    from mantis.state.store import StateStore
+    from mantis.middleware.graph_search import AutoCorrectMiddleware, GraphSearchMiddleware
 except ImportError:
-    StateStore = None  # type: ignore[assignment,misc]
+    AutoCorrectMiddleware = None  # type: ignore[assignment,misc]
+    GraphSearchMiddleware = None  # type: ignore[assignment,misc]
+
+try:
+    from mantis.middleware.state import StateMiddleware
+except ImportError:
+    StateMiddleware = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -38,78 +50,102 @@ MAX_ITERATIONS = 50
 class Agent:
     """단일 에이전트. 대화 기반으로 도구를 실행하는 마스터 루프.
 
-    Phase 2 기능:
-    - state_store: 세션 상태 자동 저장/복구 (실패 재개)
-    - approval_manager: 위험 액션 승인 대기
-
-    Phase 3 기능:
-    - graph_tool_manager: 대량 도구 시 graph-tool-call 기반 동적 검색
+    v3: 미들웨어 체인으로 횡단 관심사(트레이스, 승인, 검색, 상태)를 분리.
     """
 
     def __init__(
         self,
         name: str,
-        model_client: ModelClient,
+        model_client: LLMProvider,
         tool_registry: ToolRegistry,
         system_prompt: str = "",
-        trace_collector: TraceCollector | None = None,
-        state_store: StateStore | None = None,
+        middlewares: list[Middleware | BaseMiddleware] | None = None,
+        # Deprecated — 하위 호환용. middlewares 사용 권장.
+        trace_collector: Any | None = None,
+        state_store: Any | None = None,
         approval_patterns: list[str] | None = None,
-        graph_tool_manager: GraphToolManager | None = None,
+        graph_tool_manager: Any | None = None,
     ):
         self.name = name
         self.model_client = model_client
         self.tool_registry = tool_registry
         self.context = ConversationContext(system_prompt=system_prompt)
-        self.trace = trace_collector or TraceCollector()
-        self.state_store = state_store
-        self.approval = ApprovalManager(patterns=approval_patterns)
-        self.graph_tool_manager = graph_tool_manager
         self._session_id: str | None = None
 
-    # ─── 세션 상태 저장/복구 ───
+        # 미들웨어 체인 구성
+        self._middlewares: list[Middleware | BaseMiddleware] = list(middlewares or [])
 
-    async def _save_state(self, session_id: str) -> None:
-        """현재 컨텍스트를 State Store에 저장."""
-        if not self.state_store:
-            return
-        state = {
-            "messages": self.context.to_messages(),
-            "system_prompt": self.context.system_prompt,
-        }
-        await self.state_store.checkpoint(session_id, state)
-
-    async def _restore_state(self, session_id: str) -> bool:
-        """State Store에서 세션 복구. 복구 성공 시 True."""
-        if not self.state_store:
-            return False
-        state = await self.state_store.resume(session_id)
-        if not state:
-            return False
-
-        # 컨텍스트 복원
-        self.context = ConversationContext(
-            system_prompt=state.get("system_prompt", "")
+        # 레거시 파라미터 → 미들웨어 자동 변환
+        self._convert_legacy_params(
+            trace_collector=trace_collector,
+            state_store=state_store,
+            approval_patterns=approval_patterns,
+            graph_tool_manager=graph_tool_manager,
         )
-        for msg in state.get("messages", []):
-            if msg["role"] == "system":
-                continue  # system_prompt는 이미 설정됨
-            elif msg["role"] == "user":
-                self.context.add_user(msg["content"])
-            elif msg["role"] == "assistant":
-                self.context.add_assistant(
-                    content=msg.get("content"),
-                    tool_calls=msg.get("tool_calls"),
-                )
-            elif msg["role"] == "tool":
-                self.context.add_tool_result(
-                    tool_call_id=msg.get("tool_call_id", ""),
-                    name=msg.get("name", ""),
-                    content=msg.get("content", ""),
-                )
 
-        logger.info("세션 복구 완료: %s (%d 메시지)", session_id, len(self.context))
-        return True
+    def _convert_legacy_params(
+        self,
+        trace_collector: Any | None,
+        state_store: Any | None,
+        approval_patterns: list[str] | None,
+        graph_tool_manager: Any | None,
+    ) -> None:
+        """레거시 파라미터를 미들웨어로 변환. 각각 deprecation 경고 출력."""
+        if trace_collector is not None:
+            warnings.warn(
+                "trace_collector 파라미터는 deprecated입니다. "
+                "TraceMiddleware(collector=...) 사용을 권장합니다.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            if TraceMiddleware is not None:
+                self._middlewares.append(TraceMiddleware(collector=trace_collector))
+            else:
+                logger.warning("TraceMiddleware를 import할 수 없어 trace_collector 무시됨")
+
+        if approval_patterns is not None:
+            warnings.warn(
+                "approval_patterns 파라미터는 deprecated입니다. "
+                "ApprovalMiddleware(patterns=...) 사용을 권장합니다.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            if ApprovalMiddleware is not None:
+                self._middlewares.append(ApprovalMiddleware(patterns=approval_patterns))
+            else:
+                logger.warning("ApprovalMiddleware를 import할 수 없어 approval_patterns 무시됨")
+
+        if graph_tool_manager is not None:
+            warnings.warn(
+                "graph_tool_manager 파라미터는 deprecated입니다. "
+                "GraphSearchMiddleware / AutoCorrectMiddleware 사용을 권장합니다.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            if GraphSearchMiddleware is not None:
+                self._middlewares.append(GraphSearchMiddleware(manager=graph_tool_manager))
+            else:
+                logger.warning("GraphSearchMiddleware를 import할 수 없어 graph_tool_manager 무시됨")
+            if AutoCorrectMiddleware is not None:
+                self._middlewares.append(AutoCorrectMiddleware(manager=graph_tool_manager))
+            else:
+                logger.warning("AutoCorrectMiddleware를 import할 수 없어 graph_tool_manager 무시됨")
+
+        if state_store is not None:
+            warnings.warn(
+                "state_store 파라미터는 deprecated입니다. "
+                "StateMiddleware(store=...) 사용을 권장합니다.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            if StateMiddleware is not None:
+                self._middlewares.append(StateMiddleware(store=state_store))
+            else:
+                logger.warning("StateMiddleware를 import할 수 없어 state_store 무시됨")
+
+    def add_middleware(self, mw: Middleware | BaseMiddleware) -> None:
+        """미들웨어 추가."""
+        self._middlewares.append(mw)
 
     # ─── 메인 실행 ───
 
@@ -117,199 +153,125 @@ class Agent:
         self,
         user_input: str,
         session_id: str | None = None,
-        resume: bool = False,
     ) -> str:
         """사용자 입력을 받아 최종 텍스트 응답을 반환.
 
         Args:
             user_input: 사용자 메시지
             session_id: 세션 ID (없으면 자동 생성)
-            resume: True이면 기존 세션에서 이어서 실행 (실패 재개)
+
+        Returns:
+            LLM의 최종 텍스트 응답
         """
         session_id = session_id or str(uuid.uuid4())
         self._session_id = session_id
-        trace_id = self.trace.start_trace(session_id=session_id, agent_name=self.name)
 
-        # 실패 재개: 기존 상태 복구
-        if resume:
-            restored = await self._restore_state(session_id)
-            if restored:
-                logger.info("세션 '%s' 재개", session_id)
+        ctx = RunContext(
+            session_id=session_id,
+            agent_name=self.name,
+            last_user_message=user_input,
+        )
+
+        # on_start
+        for mw in self._middlewares:
+            await mw.on_start(ctx)
 
         self.context.add_user(user_input)
+        final_text = ""
 
-        for iteration in range(MAX_ITERATIONS):
-            # ── v2: 매 iteration마다 최신 도구 조회 ──
-            tools_schema = self._resolve_tools_schema(user_input)
+        try:
+            for iteration in range(MAX_ITERATIONS):
+                # 매 iteration마다 최신 도구 조회
+                tools_schema = self.tool_registry.to_openai_tools(session_id=session_id)
 
-            # ── Think ──
-            think_start = time.time()
-            try:
-                response = await self.model_client.generate(
-                    messages=self.context.to_messages(),
-                    tools=tools_schema if tools_schema else None,
-                )
-            except Exception as e:
-                # 모델 호출 실패 → 상태 저장 후 예외 전파 (나중에 재개 가능)
-                logger.error("모델 호출 실패: %s", e)
-                await self._save_state(session_id)
-                self.trace.add_step(trace_id, StepType.ERROR, {"error": str(e)})
-                self.trace.end_trace(trace_id)
-                raise
+                # on_before_llm — 도구 필터링/변환
+                for mw in self._middlewares:
+                    tools_schema = await mw.on_before_llm(ctx, tools_schema)
 
-            think_duration = (time.time() - think_start) * 1000
-
-            self.trace.add_step(
-                trace_id=trace_id,
-                step_type=StepType.THINK,
-                data={
-                    "model": self.model_client.model,
-                    "usage": response.usage,
-                    "duration_ms": round(think_duration),
-                    "graph_search_used": self._is_graph_search_active(),
-                },
-            )
-
-            # ── 종료 조건 ──
-            if not response.has_tool_calls:
-                self.context.add_assistant(content=response.text)
-                self.trace.add_step(trace_id, StepType.RESPONSE, {"text": response.text})
-                self.trace.end_trace(trace_id)
-                await self._save_state(session_id)
-                return response.text or ""
-
-            # ── Act: 도구 실행 ──
-            self.context.add_assistant(
-                content=response.text,
-                tool_calls=[
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
-                    }
-                    for tc in response.tool_calls
-                ],
-            )
-
-            for tc in response.tool_calls:
-                # Human-in-the-Loop: 승인 필요 여부 확인
-                if self.approval.requires_approval(tc.name, tc.arguments):
-                    approval_req = await self.approval.request_approval(
-                        session_id=session_id,
-                        tool_name=tc.name,
-                        arguments=tc.arguments,
-                    )
-                    # 상태 저장 (승인 대기 중 서버 재시작 대비)
-                    await self._save_state(session_id)
-
-                    self.trace.add_step(
-                        trace_id=trace_id,
-                        step_type=StepType.TOOL_CALL,
-                        data={
-                            "tool": tc.name,
-                            "params": tc.arguments,
-                            "approval_required": True,
-                            "approval_id": approval_req.request_id,
-                        },
-                    )
-
-                    # 승인 대기
-                    approval_req = await self.approval.wait_for_approval(approval_req.request_id)
-
-                    if approval_req.status != ApprovalStatus.APPROVED:
-                        # 거절 또는 만료 → 결과에 반영
-                        result_str = json.dumps(
-                            {"rejected": True, "reason": approval_req.result or "승인 거절됨"},
-                            ensure_ascii=False,
-                        )
-                        self.context.add_tool_result(tc.id, tc.name, result_str)
-                        continue
-
-                # 도구 이름 검증 + 자동 교정
-                actual_name = tc.name
-                actual_args = tc.arguments
-                if self.graph_tool_manager:
-                    validation = self.graph_tool_manager.validate_call(tc.name, tc.arguments)
-                    if validation.get("corrected_name") and validation["corrected_name"] != tc.name:
-                        logger.info("도구 이름 자동 교정: '%s' → '%s'", tc.name, validation["corrected_name"])
-                        actual_name = validation["corrected_name"]
-                    if validation.get("corrected_arguments"):
-                        actual_args = validation["corrected_arguments"]
-
-                # 도구 실행
-                act_start = time.time()
+                # Think
                 try:
-                    result = await self.tool_registry.execute(
-                        {"name": actual_name, "arguments": actual_args},
-                        session_id=self._session_id,
+                    response = await self.model_client.generate(
+                        messages=self.context.to_messages(),
+                        tools=tools_schema if tools_schema else None,
                     )
                 except Exception as e:
-                    # 도구 실행 실패 → 상태 저장 (실패 재개 지원)
-                    logger.error("도구 '%s' 실행 실패: %s", actual_name, e)
-                    await self._save_state(session_id)
-                    result = {"name": actual_name, "error": str(e)}
+                    raise LLMError(f"모델 호출 실패: {e}") from e
 
-                act_duration = (time.time() - act_start) * 1000
+                # 종료 조건
+                if not response.has_tool_calls:
+                    final_text = response.text or ""
+                    self.context.add_assistant(content=final_text)
+                    break
 
-                result_str = json.dumps(
-                    result.get("result", result.get("error", "")),
-                    ensure_ascii=False, default=str,
-                )
-                self.context.add_tool_result(tc.id, tc.name, result_str)
-
-                # graph-tool-call 호출 이력 기록
-                if self.graph_tool_manager:
-                    self.graph_tool_manager.record_call(tc.name)
-
-                self.trace.add_step(
-                    trace_id=trace_id,
-                    step_type=StepType.TOOL_CALL,
-                    data={
-                        "tool": tc.name,
-                        "params": tc.arguments,
-                        "result": result,
-                        "duration_ms": round(act_duration),
-                    },
+                # assistant 메시지 기록 (tool_calls 포함)
+                self.context.add_assistant(
+                    content=response.text,
+                    tool_calls=[
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments),
+                            },
+                        }
+                        for tc in response.tool_calls
+                    ],
                 )
 
-            # 매 반복마다 상태 저장
-            await self._save_state(session_id)
+                # Act
+                for tc in response.tool_calls:
+                    name, args, block_reason = tc.name, tc.arguments, None
 
-        logger.warning("Agent '%s' 최대 반복(%d) 초과", self.name, MAX_ITERATIONS)
-        self.trace.end_trace(trace_id)
-        return "[오류] 최대 실행 횟수를 초과했습니다."
+                    # on_before_tool — 승인, 자동 교정
+                    for mw in self._middlewares:
+                        name, args, block_reason = await mw.on_before_tool(ctx, name, args)
+                        if block_reason:
+                            break
 
-    # ─── 도구 스키마 결정 ───
+                    if block_reason:
+                        self.context.add_tool_result(
+                            tc.id,
+                            tc.name,
+                            json.dumps(
+                                {"blocked": True, "reason": block_reason},
+                                ensure_ascii=False,
+                            ),
+                        )
+                        continue
 
-    def _resolve_tools_schema(self, query: str) -> list[dict]:
-        """도구 수에 따라 전체 목록 또는 graph-tool-call 검색 결과 반환.
+                    # 도구 실행
+                    try:
+                        result = await self.tool_registry.execute(
+                            {"name": name, "arguments": args},
+                            session_id=session_id,
+                        )
+                    except Exception as e:
+                        logger.error("도구 '%s' 실행 실패: %s", name, e)
+                        result = {"name": name, "error": str(e)}
 
-        도구 수가 임계값 미만이면 전체 도구를 LLM에 전달.
-        임계값 이상이면 graph-tool-call로 쿼리 관련 도구만 검색하여 전달.
-        """
-        if self._is_graph_search_active():
-            try:
-                graph_tools = self.graph_tool_manager.retrieve_as_openai_tools(query)
-                if graph_tools:
-                    logger.info(
-                        "graph-tool-call: 쿼리 '%s' → %d개 도구 검색됨",
-                        query[:50],
-                        len(graph_tools),
+                    # on_after_tool — 트레이스, 상태 체크포인트
+                    for mw in self._middlewares:
+                        await mw.on_after_tool(ctx, name, args, result)
+
+                    # Observe
+                    result_str = json.dumps(
+                        result.get("result", result.get("error", "")),
+                        ensure_ascii=False,
+                        default=str,
                     )
-                    return graph_tools
-                # 검색 결과 없으면 전체 도구 폴백
-                logger.warning("graph-tool-call 검색 결과 없음, 전체 도구 사용")
-            except Exception as e:
-                logger.error("graph-tool-call 검색 실패: %s — 전체 도구 사용", e)
+                    self.context.add_tool_result(tc.id, tc.name, result_str)
+            else:
+                # MAX_ITERATIONS 초과
+                logger.warning("Agent '%s' 최대 반복(%d) 초과", self.name, MAX_ITERATIONS)
+                final_text = "[오류] 최대 실행 횟수를 초과했습니다."
 
-        return self.tool_registry.to_openai_tools(session_id=self._session_id)
+        finally:
+            # on_end — 항상 실행
+            for mw in self._middlewares:
+                await mw.on_end(ctx, final_text)
 
-    def _is_graph_search_active(self) -> bool:
-        """graph-tool-call 검색 모드 활성 여부."""
-        return (
-            self.graph_tool_manager is not None
-            and self.graph_tool_manager.should_use_search
-        )
+        return final_text
 
     # ─── 스트리밍 실행 ───
 
@@ -317,149 +279,142 @@ class Agent:
         self,
         user_input: str,
         session_id: str | None = None,
-        resume: bool = False,
     ) -> AsyncIterator[dict]:
         """SSE 스트리밍용 — 각 단계를 이벤트로 yield.
 
         이벤트 타입:
-            thinking, tool_call, tool_result, approval_required, done, error
+            thinking, tool_call, tool_result, blocked, done, error
         """
         session_id = session_id or str(uuid.uuid4())
         self._session_id = session_id
-        trace_id = self.trace.start_trace(session_id=session_id, agent_name=self.name)
 
-        if resume:
-            restored = await self._restore_state(session_id)
-            if restored:
-                yield {"type": "resumed", "data": {"session_id": session_id}}
+        ctx = RunContext(
+            session_id=session_id,
+            agent_name=self.name,
+            last_user_message=user_input,
+        )
+
+        # on_start
+        for mw in self._middlewares:
+            await mw.on_start(ctx)
 
         self.context.add_user(user_input)
+        final_text = ""
 
-        for iteration in range(MAX_ITERATIONS):
-            # ── v2: 매 iteration마다 최신 도구 조회 ──
-            tools_schema = self._resolve_tools_schema(user_input)
+        try:
+            for iteration in range(MAX_ITERATIONS):
+                # 매 iteration마다 최신 도구 조회
+                tools_schema = self.tool_registry.to_openai_tools(session_id=session_id)
 
-            yield {"type": "thinking", "data": {
-                "iteration": iteration + 1,
-                "graph_search_used": self._is_graph_search_active(),
-                "tools_count": len(tools_schema) if tools_schema else 0,
-            }}
+                # on_before_llm
+                for mw in self._middlewares:
+                    tools_schema = await mw.on_before_llm(ctx, tools_schema)
 
-            _think_start = time.time()
-            try:
-                response = await self.model_client.generate(
-                    messages=self.context.to_messages(),
-                    tools=tools_schema if tools_schema else None,
-                )
-            except Exception as e:
-                self.trace.add_step(trace_id, StepType.ERROR, {"error": str(e)})
-                await self._save_state(session_id)
-                yield {"type": "error", "data": {"error": str(e), "resumable": True}}
-                return
-            _think_ms = (time.time() - _think_start) * 1000
+                yield {
+                    "type": "thinking",
+                    "data": {
+                        "iteration": iteration + 1,
+                        "tools_count": len(tools_schema) if tools_schema else 0,
+                    },
+                }
 
-            self.trace.add_step(trace_id, StepType.THINK, {
-                "duration_ms": round(_think_ms),
-                "model": self.model_client.model,
-                "input_tokens": getattr(response, "input_tokens", None),
-                "output_tokens": getattr(response, "output_tokens", None),
-            })
-
-            if not response.has_tool_calls:
-                self.trace.add_step(trace_id, StepType.RESPONSE, {
-                    "text": response.text or "",
-                    "duration_ms": round(_think_ms),
-                })
-                self.context.add_assistant(content=response.text)
-                self.trace.end_trace(trace_id)
-                await self._save_state(session_id)
-                yield {"type": "done", "data": response.text or ""}
-                return
-
-            self.context.add_assistant(
-                content=response.text,
-                tool_calls=[
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
-                    }
-                    for tc in response.tool_calls
-                ],
-            )
-
-            for tc in response.tool_calls:
-                # 승인 체크
-                if self.approval.requires_approval(tc.name, tc.arguments):
-                    approval_req = await self.approval.request_approval(
-                        session_id=session_id,
-                        tool_name=tc.name,
-                        arguments=tc.arguments,
-                    )
-                    await self._save_state(session_id)
-                    yield {
-                        "type": "approval_required",
-                        "data": approval_req.to_dict(),
-                    }
-
-                    approval_req = await self.approval.wait_for_approval(approval_req.request_id)
-                    if approval_req.status != ApprovalStatus.APPROVED:
-                        result_str = json.dumps(
-                            {"rejected": True, "reason": approval_req.result or "승인 거절"},
-                            ensure_ascii=False,
-                        )
-                        self.context.add_tool_result(tc.id, tc.name, result_str)
-                        yield {"type": "approval_rejected", "data": {"request_id": approval_req.request_id}}
-                        continue
-
-                # 도구 이름 검증 + 자동 교정 (graph-tool-call validate)
-                actual_name = tc.name
-                actual_args = tc.arguments
-                if self.graph_tool_manager:
-                    validation = self.graph_tool_manager.validate_call(tc.name, tc.arguments)
-                    if validation.get("corrected_name") and validation["corrected_name"] != tc.name:
-                        logger.info(
-                            "도구 이름 자동 교정: '%s' → '%s'",
-                            tc.name, validation["corrected_name"],
-                        )
-                        actual_name = validation["corrected_name"]
-                    if validation.get("corrected_arguments"):
-                        actual_args = validation["corrected_arguments"]
-
-                yield {"type": "tool_call", "data": {"name": actual_name, "arguments": actual_args}}
-
-                _tool_start = time.time()
+                # Think
                 try:
-                    result = await self.tool_registry.execute(
-                        {"name": actual_name, "arguments": actual_args},
-                        session_id=self._session_id,
+                    response = await self.model_client.generate(
+                        messages=self.context.to_messages(),
+                        tools=tools_schema if tools_schema else None,
                     )
                 except Exception as e:
-                    await self._save_state(session_id)
-                    result = {"name": actual_name, "error": str(e)}
-                _tool_ms = (time.time() - _tool_start) * 1000
+                    yield {
+                        "type": "error",
+                        "data": {"error": str(e), "resumable": True},
+                    }
+                    return
 
-                result_str = json.dumps(
-                    result.get("result", result.get("error", "")),
-                    ensure_ascii=False, default=str,
+                # 종료 조건
+                if not response.has_tool_calls:
+                    final_text = response.text or ""
+                    self.context.add_assistant(content=final_text)
+                    yield {"type": "done", "data": final_text}
+                    return
+
+                # assistant 메시지 기록 (tool_calls 포함)
+                self.context.add_assistant(
+                    content=response.text,
+                    tool_calls=[
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments),
+                            },
+                        }
+                        for tc in response.tool_calls
+                    ],
                 )
-                self.context.add_tool_result(tc.id, tc.name, result_str)
 
-                self.trace.add_step(trace_id, StepType.TOOL_CALL, {
-                    "tool": tc.name,
-                    "params": tc.arguments,
-                    "result": result.get("result", result.get("error")),
-                    "success": "error" not in result,
-                    "duration_ms": round(_tool_ms),
-                })
+                # Act
+                for tc in response.tool_calls:
+                    name, args, block_reason = tc.name, tc.arguments, None
 
-                # graph-tool-call 호출 이력 기록
-                if self.graph_tool_manager:
-                    self.graph_tool_manager.record_call(tc.name)
+                    # on_before_tool
+                    for mw in self._middlewares:
+                        name, args, block_reason = await mw.on_before_tool(ctx, name, args)
+                        if block_reason:
+                            break
 
-                yield {"type": "tool_result", "data": result}
+                    if block_reason:
+                        self.context.add_tool_result(
+                            tc.id,
+                            tc.name,
+                            json.dumps(
+                                {"blocked": True, "reason": block_reason},
+                                ensure_ascii=False,
+                            ),
+                        )
+                        yield {
+                            "type": "blocked",
+                            "data": {
+                                "tool": tc.name,
+                                "reason": block_reason,
+                            },
+                        }
+                        continue
 
-            await self._save_state(session_id)
+                    yield {
+                        "type": "tool_call",
+                        "data": {"name": name, "arguments": args},
+                    }
 
-        self.trace.end_trace(trace_id)
-        yield {"type": "error", "data": "최대 실행 횟수 초과"}
+                    # 도구 실행
+                    try:
+                        result = await self.tool_registry.execute(
+                            {"name": name, "arguments": args},
+                            session_id=session_id,
+                        )
+                    except Exception as e:
+                        logger.error("도구 '%s' 실행 실패: %s", name, e)
+                        result = {"name": name, "error": str(e)}
+
+                    # on_after_tool
+                    for mw in self._middlewares:
+                        await mw.on_after_tool(ctx, name, args, result)
+
+                    # Observe
+                    result_str = json.dumps(
+                        result.get("result", result.get("error", "")),
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    self.context.add_tool_result(tc.id, tc.name, result_str)
+
+                    yield {"type": "tool_result", "data": result}
+
+            # MAX_ITERATIONS 초과
+            yield {"type": "error", "data": "최대 실행 횟수 초과"}
+
+        finally:
+            # on_end — 항상 실행
+            for mw in self._middlewares:
+                await mw.on_end(ctx, final_text)

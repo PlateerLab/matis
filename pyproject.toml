@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mantis"
-version = "0.1.0"
-description = "AI Agent 실행 엔진 — 도구를 갈아끼워서 쏜다"
+version = "0.3.0"
+description = "AI Agent 실행 엔진 — 엔진은 Generator + Executor 두 개뿐. 나머지는 전부 도구."
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
