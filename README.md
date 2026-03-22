@@ -1,9 +1,11 @@
-# Mantis
+<h1 align="center">Mantis</h1>
 
-[![Python](https://img.shields.io/pypi/pyversions/mantis)](https://pypi.org/project/mantis/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+<p align="center">
+  <a href="https://pypi.org/project/mantis/"><img src="https://img.shields.io/pypi/pyversions/mantis" alt="Python"></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+</p>
 
-**Execution engine for AI agents.**
+<p align="center"><strong>Execution engine for AI agents.</strong></p>
 
 The engine is just two things: a Generator and an Executor. Everything else is a tool.
 
@@ -67,6 +69,7 @@ Only what can't be a tool → is engine.
 | `list_workflows` | List registered workflows |
 | `search_tools` | Search for tools by query |
 | `list_tools` | List all available tools |
+| `manage_session` | Resume, delete, or list session checkpoints |
 
 ## Streaming
 
@@ -337,7 +340,8 @@ mantis/
 │   └── approval.py              # ApprovalManager
 │
 ├── state/                       # pip install mantis[state]
-│   └── store.py                 # StateStore (PostgreSQL)
+│   ├── store.py                 # StateStore (PostgreSQL)
+│   └── tools.py                 # make_state_tools() — manage_session
 │
 ├── trace/
 │   ├── collector.py             # TraceCollector
@@ -358,7 +362,7 @@ mantis/
 - **Everything is a Tool** — Workflows, sandbox, search are all tools. Engine is just loop + generators + storage.
 - **Middleware for cross-cutting concerns** — Approval, tracing, state persistence hook into the agent loop automatically.
 - **LLMProvider Protocol** — Plug in any LLM implementation. OpenAI-compatible client included.
-- **`make_*_tools()` pattern** — Consistent factory pattern to convert infrastructure into tools.
+- **`make_*_tools()` pattern** — Consistent factory pattern to convert infrastructure into tools: `make_sandbox_tools()`, `make_create_tool()`, `make_workflow_tools()`, `make_registry_tools()`, `make_state_tools()`.
 - **Live Registry** — Create tools mid-conversation, use them immediately. Session-scoped isolation.
 - **Single required dependency** — Only `httpx`. Everything else is optional.
 - **Standalone modules** — Use sandbox, search, or any module independently without the Agent.
