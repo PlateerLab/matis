@@ -5,7 +5,7 @@
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
 </p>
 
-<p align="center"><strong>Execution engine for AI agents.</strong></p>
+<p><strong>Execution engine for AI agents.</strong></p>
 
 The engine is just two things: a Generator and an Executor. Everything else is a tool.
 
