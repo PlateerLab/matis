@@ -16,15 +16,6 @@ from mantis.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-# ToolGenerator 인스턴스 참조 (app.py에서 주입)
-_generator_ref: "ToolGenerator | None" = None
-
-
-def set_tool_generator(generator: "ToolGenerator") -> None:
-    """app.py startup에서 ToolGenerator 인스턴스를 주입."""
-    global _generator_ref
-    _generator_ref = generator
-
 
 TOOL_GENERATION_PROMPT = """\
 사용자가 요청한 도구를 Python 코드로 작성하고, 테스트 코드도 함께 작성해줘.
@@ -322,32 +313,6 @@ class ToolGenerator:
         return None
 
 
-
-# ─── v1 호환: 모듈 레벨 create_tool (기존 코드 유지) ───
-
-@tool(
-    name="create_tool",
-    description="사용자의 자연어 설명을 바탕으로 새로운 도구(@tool)를 AI가 자동 생성한다. 코드를 생성하고 샌드박스에서 테스트한 뒤 Tool Registry에 등록한다.",
-    parameters={
-        "description": {
-            "type": "string",
-            "description": "만들고 싶은 도구에 대한 자연어 설명",
-        },
-    },
-)
-async def create_tool(description: str) -> dict:
-    """AI가 코드 생성 → 샌드박스 테스트 → Registry 등록까지 e2e 실행."""
-    if not _generator_ref:
-        return {
-            "status": "error",
-            "error": "ToolGenerator 미초기화 — set_tool_generator() 필요",
-        }
-
-    result = await _generator_ref.generate(description)
-    return result
-
-
-# ─── v2: 팩토리 함수 — ToolGenerator 인스턴스를 받아서 도구로 변환 ───
 
 def make_create_tool(generator: ToolGenerator) -> ToolSpec:
     """ToolGenerator를 Agent가 호출할 수 있는 @tool로 변환.

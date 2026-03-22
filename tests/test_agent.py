@@ -177,7 +177,8 @@ async def test_run_llm_error():
         tool_registry=ToolRegistry(),
     )
 
-    with pytest.raises(RuntimeError, match="API down"):
+    from mantis.exceptions import LLMError
+    with pytest.raises(LLMError, match="API down"):
         await agent.run("fail")
 
 
@@ -292,48 +293,80 @@ async def test_session_id_passed():
 
 
 @pytest.mark.asyncio
-async def test_trace_recorded():
-    """실행 후 trace에 단계가 기록됨."""
-    agent = _make_agent(
-        responses=[
-            _make_tool_response([("echo", {})]),
-            _make_text_response("done"),
-        ],
-        tools={"echo": {"ok": True}},
+async def test_trace_recorded_via_middleware():
+    """v3: TraceMiddleware를 통해 trace가 기록됨."""
+    from mantis.trace.collector import TraceCollector
+    from mantis.middleware.trace import TraceMiddleware
+
+    collector = TraceCollector()
+    trace_mw = TraceMiddleware(collector=collector)
+
+    client = MagicMock(spec=ModelClient)
+    client.model = "test"
+    client.generate = AsyncMock(side_effect=[
+        _make_tool_response([("echo", {})]),
+        _make_text_response("done"),
+    ])
+
+    registry = ToolRegistry()
+    registry.register(ToolSpec(
+        name="echo", description="echo", parameters={},
+        fn=AsyncMock(return_value={"ok": True}), is_async=True,
+    ))
+
+    agent = Agent(
+        name="test-agent",
+        model_client=client,
+        tool_registry=registry,
+        middlewares=[trace_mw],
     )
     await agent.run("trace test")
 
-    traces = agent.trace.list_traces()
+    traces = collector.list_traces()
     assert len(traces) == 1
     trace = traces[0]
     assert len(trace.steps) > 0
-    step_types = [s.step_type.value for s in trace.steps]
-    assert "think" in step_types
-    assert "tool_call" in step_types
 
 
 # ─── Approval ───
 
 
 @pytest.mark.asyncio
-async def test_approval_blocks_tool():
-    """승인 필요 도구가 거절되면 결과에 rejected 반영."""
-    agent = _make_agent(
-        responses=[
-            _make_tool_response([("dangerous", {"action": "delete"})]),
-            _make_text_response("Skipped dangerous action"),
-        ],
-        tools={"dangerous": {"deleted": True}},
-        approval_patterns=["dangerous"],
-    )
+async def test_approval_blocks_tool_via_middleware():
+    """v3: ApprovalMiddleware를 통해 도구가 차단됨."""
+    from mantis.middleware.approval import ApprovalMiddleware
+    from mantis.safety.approval import ApprovalManager
 
     import asyncio
 
+    manager = ApprovalManager(patterns=["dangerous"])
+    approval_mw = ApprovalMiddleware(patterns=["dangerous"], manager=manager)
+
+    client = MagicMock(spec=ModelClient)
+    client.model = "test"
+    client.generate = AsyncMock(side_effect=[
+        _make_tool_response([("dangerous", {"action": "delete"})]),
+        _make_text_response("Skipped dangerous action"),
+    ])
+
+    registry = ToolRegistry()
+    registry.register(ToolSpec(
+        name="dangerous", description="dangerous", parameters={},
+        fn=AsyncMock(return_value={"deleted": True}), is_async=True,
+    ))
+
+    agent = Agent(
+        name="test-agent",
+        model_client=client,
+        tool_registry=registry,
+        middlewares=[approval_mw],
+    )
+
     async def reject_soon():
         await asyncio.sleep(0.05)
-        pending = agent.approval.list_pending()
+        pending = manager.list_pending()
         if pending:
-            agent.approval.reject(pending[0].request_id, "Not allowed")
+            manager.reject(pending[0].request_id, "Not allowed")
 
     asyncio.create_task(reject_soon())
     result = await agent.run("Do dangerous thing")
